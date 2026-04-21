@@ -35,8 +35,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .btn-p{background:var(--text);color:var(--surface);border-color:transparent;font-weight:500}
 .btn-p:hover{opacity:.85;background:var(--text)}
 .btn-f{background:#FBEAF0;color:#4B1528;border-color:#ED93B1;font-weight:500}
-.btn-f:hover{background:#F4C0D1}
-.graph-area{flex:1;position:relative;overflow:hidden;user-select:none}
+.btn-f:hover{background:#F4C0D1} .btn-f:disabled{opacity:.4;cursor:default;background:#FBEAF0}
+.graph-area{flex:1;position:relative;overflow:hidden;user-select:none} #svg{transition:opacity .3s;}
 #svg{width:100%;height:100%;display:block}
 .hintbar{position:absolute;bottom:0;left:0;right:0;padding:6px 16px;
   background:rgba(255,255,255,0.9);backdrop-filter:blur(6px);
@@ -88,31 +88,39 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div class="pill end" id="lbl-end">—</div>
     <div class="score">Очки: <b id="lbl-score">0</b></div>
     <div class="btns">
-      <button class="btn btn-f" onclick="finishGame()">Финиш!</button>
+      <button class="btn btn-f" id="btn-finish" onclick="finishGame()" disabled>Финиш!</button>
+      <button class="btn" id="btn-hint" onclick="getHints()" title="Подсказка">💡</button>
       <button class="btn" onclick="pickRandom()">Новая игра</button>
     </div>
   </div>
   <div class="graph-area" id="ga">
     <svg id="svg"></svg>
-    <div class="hintbar">
-      <span><span class="hk">тянуть карточку</span> — переместить</span>
-      <span><span class="hk">тянуть от кружка ●</span> — создать связь</span>
-      <span><span class="hk">2×клик</span> на холсте — добавить слово</span>
-      <span><span class="hk">клик по связи + Del</span> — удалить</span>
-    </div>
+
     <div class="toast" id="toast" style="opacity:0"></div>
     <div class="popup" id="popup">
       <input id="popup-inp" type="text" placeholder="Введите слово..." maxlength="30"/>
       <div class="popup-hint">Enter — добавить · Esc — отмена</div>
     </div>
   </div>
+  <div id="hints-bar" style="display:none;padding:9px 20px;background:#EEEDFE;border-top:0.5px solid #AFA9EC;flex-shrink:0;">
+    <span style="font-size:12px;font-weight:600;color:#534AB7;margin-right:12px;">💡 Идеи для моста:</span>
+    <span id="hints-chips" style="display:inline-flex;gap:8px;flex-wrap:wrap;"></span>
+  </div>
+  <div id="reasoning-bar" style="
+    display:none; padding:9px 20px; background:var(--surface);
+    border-top:0.5px solid var(--border2); flex-shrink:0;
+    font-size:13px; color:var(--text2); line-height:1.5; max-height:68px; overflow:hidden;">
+    <span id="reasoning-label" style="font-weight:600;color:var(--text);margin-right:8px;white-space:nowrap;"></span>
+    <span id="reasoning-text"></span>
+  </div>
+  <div class="hintbar" style="position:static;backdrop-filter:none;border-top:0.5px solid var(--border2);">
+    <span><span class="hk">тянуть карточку</span> — переместить</span>
+    <span><span class="hk">тянуть от кружка ●</span> — создать связь</span>
+    <span><span class="hk">2×клик</span> на холсте — добавить слово</span>
+    <span><span class="hk">клик по связи + Del</span> — удалить</span>
+  </div>
 </div>
 
-<div class="overlay" id="pair-modal">
-  <div class="modal">
-    <h2>Выберите пару слов</h2>
-    <p>Постройте цепочку ассоциаций между двумя словами</p>
-    <div class="pgrid" id="pgrid"></div>
     <div class="mact"><button class="btn btn-p" onclick="pickRandom()">Случайная пара</button></div>
   </div>
 </div>
@@ -208,7 +216,7 @@ var NS="http://www.w3.org/1999/xhtml";
 var SVG="http://www.w3.org/2000/svg";
 
 var nodes=[],edges=[],nid=0,totalScore=0,startWord="",endWord="";
-var selectedEdge=null,busy=false,pendingEdgeSrc=null,pendingEdgePos=null;
+var selectedEdge=null,busy=false,pendingEdgeSrc=null,pendingEdgePos=null,suppressNextClick=false;
 var svg,edgeLayer,nodeLayer,dragLineEl;
 
 // Port offsets [dx,dy] relative to node center
@@ -234,13 +242,58 @@ async function groqReq(prompt,mt){
   return(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||""
 }
 
+var pairCache={}; // word1+"|"+word2 -> score
+var nextPair=null; // preloaded pair
+
+async function preloadNextPair(){
+  if(!getKey()) return;
+  try{
+    var candidates=[];
+    for(var i=0;i<5;i++) candidates.push(randomPair());
+    var results=await Promise.all(candidates.map(function(p){
+      var key=p[0]+"|"+p[1];
+      if(pairCache[key]!==undefined) return Promise.resolve({pair:p,score:pairCache[key]});
+      return quickScore(p[0],p[1]).then(function(score){
+        pairCache[key]=score; return {pair:p,score:score};
+      });
+    }));
+    results.sort(function(a,b){return a.score-b.score;});
+    nextPair=results[0].pair;
+  }catch(e){ nextPair=null; }
+}
+
+async function quickScore(w1,w2){
+  try{
+    var t=await groqReq("Rate similarity of Russian words "+w1+" and "+w2+" from 0 to 100. Integer only.",8);
+    var m=t.match(/\d+/);if(!m)return 50;
+    var n=parseInt(m[0],10);return isNaN(n)?50:Math.min(100,Math.max(0,n));
+  }catch(e){return 50;}
+}
+
 async function evalSim(w1,w2){
-  var t=await groqReq(
-    "Rate semantic similarity of two Russian words 0-100. 0=unrelated, 100=synonyms. "+
-    "Consider all associations and metaphors. Words: "+w1+" and "+w2+". "+
-    "Reply with ONE integer only, nothing else.",16);
-  var m=t.match(/\d+/);if(!m)return 50;
-  var n=parseInt(m[0],10);return isNaN(n)?50:Math.min(100,Math.max(0,n));
+  var prompt=
+    "Оцени ассоциативную и смысловую близость двух русских слов по шкале от 0 до 100.\n\n"+
+    "Сначала напиши короткое рассуждение (1-2 предложения): какая связь между словами, "+
+    "прямая или косвенная, культурная или эмоциональная.\n"+
+    "Затем с новой строки напиши итоговое число.\n\n"+
+    "Шкала:\n"+
+    "0-15 — нет связи (КИРПИЧ и НЕЖНОСТЬ)\n"+
+    "16-35 — очень слабая (МАТЕМАТИКА и ЗАКАТ)\n"+
+    "36-55 — есть что-то общее (ДОЖДЬ и ГРУСТЬ = 48)\n"+
+    "56-72 — заметная ассоциация (КОСМОС и ЗВЕЗДА = 68)\n"+
+    "73-88 — сильная связь (ВДОХНОВЕНИЕ и ЗАКАТ = 79, ВДОХНОВЕНИЕ и РЕКА = 74)\n"+
+    "89-100 — почти синонимы (ТОСКА и ПЕЧАЛЬ = 91)\n\n"+
+    "Слова: "+w1+" и "+w2;
+  var t=await groqReq(prompt,120);
+  // extract last number in response (after reasoning)
+  var matches=t.match(/\d+/g);
+  if(!matches||matches.length===0) return {score:50,reasoning:t.trim()};
+  var n=parseInt(matches[matches.length-1],10);
+  var score=isNaN(n)?50:Math.min(100,Math.max(0,n));
+  // reasoning = everything before the last number
+  var lastNumIdx=t.lastIndexOf(matches[matches.length-1]);
+  var reasoning=t.slice(0,lastNumIdx).trim().replace(/[:\n]+$/,"").trim();
+  return {score:score, reasoning:reasoning||t.trim()};
 }
 
 async function fetchEmoji(word){
@@ -308,7 +361,11 @@ function initSVG(){
     showPopup(ev.clientX-rc.left,ev.clientY-rc.top);
   });
   svg.addEventListener("click",function(ev){
-    if(ev.target===svg||ev.target===edgeLayer)deselectEdge();
+    if(ev.target===svg||ev.target===edgeLayer){
+      if(suppressNextClick){ suppressNextClick=false; return; }
+      deselectEdge();
+      hidePopup();
+    }
   });
 }
 
@@ -329,6 +386,15 @@ function makeEdgeEl(e){
     ev.stopPropagation();
     if(selectedEdge===e.id){deselectEdge();return}
     selectEdge(e.id);
+  });
+  g.addEventListener("mouseenter",function(){
+    if(e.reasoning) showReasoning(
+      (nodes.find(function(n){return n.id===e.source})||{}).word||"",
+      (nodes.find(function(n){return n.id===e.target})||{}).word||"",
+      e.score, e.reasoning);
+  });
+  g.addEventListener("mouseleave",function(){
+    hideReasoning();
   });
 
   e._el={g:g,line:line,badge:badge,label:label};
@@ -548,6 +614,7 @@ function makeDragEdge(port,n,portOffset){
       // dropped on empty space — show popup and auto-connect to source node
       pendingEdgeSrc=n.id;
       pendingEdgePos={x:px,y:py};
+      suppressNextClick=true;
       showPopup(px,py);
     }
     window.removeEventListener("mousemove",onMove);
@@ -580,13 +647,15 @@ async function addEdge(srcId,tgtId){
   busy=true;
   toast("Scoring: "+s.word+" \u2014 "+t.word,"load");
   try{
-    var score=await evalSim(s.word,t.word);
-    var e={id:"e"+(nid++),source:srcId,target:tgtId,score:score};
+    var result=await evalSim(s.word,t.word);
+    var e={id:"e"+(nid++),source:srcId,target:tgtId,score:result.score,reasoning:result.reasoning};
     edges.push(e);
     makeEdgeEl(e);
-    totalScore+=score;
+    totalScore+=result.score;
     document.getElementById("lbl-score").textContent=totalScore;
-    toast(s.word+" \u2014 "+t.word+": "+score+" pts","ok");
+    toast(s.word+" \u2014 "+t.word+": "+result.score+" pts","ok");
+    showReasoning(s.word,t.word,result.score,result.reasoning);
+    checkFinishBtn();
   }catch(ex){toast("Error: "+ex.message,"err",4000)}
   busy=false;
 }
@@ -597,6 +666,7 @@ function deleteEdge(id){
   edges=edges.filter(function(x){return x.id!==id});
   if(selectedEdge===id)selectedEdge=null;
   document.getElementById("lbl-score").textContent=totalScore;
+  checkFinishBtn();
   toast("Edge removed","ok");
 }
 
@@ -616,6 +686,7 @@ function deleteNode(id){
 
 // ---- Popup ----
 function showPopup(x,y){
+  if(!pendingEdgePos) pendingEdgePos={x:x,y:y};
   var p=document.getElementById("popup");
   p.style.display="block";p.style.left=(x+10)+"px";p.style.top=(y-20)+"px";
   var inp=document.getElementById("popup-inp");inp.value="";
@@ -651,6 +722,80 @@ document.getElementById("popup-inp").addEventListener("keydown",function(ev){
 document.getElementById("popup").addEventListener("click",function(ev){ev.stopPropagation()});
 
 // ---- Finish / Result ----
+async function getHints(){
+  var btn=document.getElementById("btn-hint");
+  if(!btn||btn.disabled) return;
+  btn.disabled=true;
+  btn.textContent="⏳";
+  toast("Ищу слова-мостики...","load");
+  try{
+    var prompt=
+      "Ты помогаешь игроку построить смысловой мост между двумя словами.\n"+
+      "Придумай ровно 5 русских слов, которые находятся примерно посередине по смыслу между словами: "+
+      startWord+" и "+endWord+".\n"+
+      "Слова должны быть связаны с обоими концами, но не быть синонимами ни одного из них.\n"+
+      "Это могут быть существительные, прилагательные, глаголы — любые части речи.\n"+
+      "Ответь ТОЛЬКО списком из 5 слов через запятую, без нумерации и пояснений.";
+    var t=await groqReq(prompt,60);
+    var words=t.split(/[,;\n]/).map(function(w){return w.trim().toUpperCase();}).filter(function(w){return w.length>1;}).slice(0,5);
+    var chips=document.getElementById("hints-chips");
+    chips.innerHTML="";
+    words.forEach(function(w){
+      var chip=document.createElement("span");
+      chip.textContent=w;
+      chip.style.cssText="background:white;border:1px solid #AFA9EC;border-radius:20px;padding:3px 12px;font-size:13px;color:#26215C;cursor:pointer;";
+      chip.title="Добавить слово в граф";
+      chip.onclick=function(){
+        if(!nodes.find(function(n){return n.word===w;})){
+          var ga=document.getElementById("ga"),rc=ga.getBoundingClientRect();
+          var nd={id:"n"+(nid++),word:w,type:"chain",
+            x:Math.round(rc.width/2+(Math.random()-0.5)*200),
+            y:Math.round(rc.height/2+(Math.random()-0.5)*150),em:"⏳"};
+          nodes.push(nd);makeNodeEl(nd);
+          fetchEmoji(w).then(function(icon){var n2=getNode(nd.id);if(n2&&n2._el){n2.em=icon;EM[w]=icon;n2._el.emoji.textContent=icon;}});
+          toast("Добавлено: "+w,"ok");
+        }
+      };
+      chips.appendChild(chip);
+    });
+    document.getElementById("hints-bar").style.display="block";
+    toast("Вот несколько идей!","ok");
+  } catch(ex){
+    toast("Ошибка: "+ex.message,"err",4000);
+  }
+  btn.disabled=false;
+  btn.textContent="💡";
+}
+
+function checkFinishBtn(){
+  var sn=nodes.find(function(n){return n.type==="start"});
+  var en=nodes.find(function(n){return n.type==="end"});
+  var btn=document.getElementById("btn-finish");
+  if(!btn||!sn||!en){if(btn)btn.disabled=true;return;}
+  var adj={};
+  nodes.forEach(function(n){adj[n.id]=[]});
+  edges.forEach(function(e){
+    if(adj[e.source])adj[e.source].push(e.target);
+    if(adj[e.target])adj[e.target].push(e.source);
+  });
+  var visited=new Set(),q=[sn.id];
+  while(q.length){var cur=q.shift();if(visited.has(cur))continue;visited.add(cur);
+    if(cur===en.id)break;(adj[cur]||[]).forEach(function(nb){q.push(nb)});}
+  btn.disabled=!visited.has(en.id);
+}
+
+function showReasoning(w1,w2,score,text){
+  var bar=document.getElementById("reasoning-bar");
+  var lbl=document.getElementById("reasoning-label");
+  var txt=document.getElementById("reasoning-text");
+  lbl.textContent=w1+" \u2014 "+w2+": "+score;
+  txt.textContent=text;
+  bar.style.display="block";
+}
+function hideReasoning(){
+  // don't hide on mouseleave if it's the last added edge — keep it visible
+}
+
 function finishGame(){
   var sn=nodes.find(function(n){return n.type==="start"});
   var en=nodes.find(function(n){return n.type==="end"});
@@ -687,27 +832,40 @@ function showResult(){
 function hideResult(){document.getElementById("res-modal").style.display="none"}
 
 // ---- Pair modal ----
-function showPairModal(){document.getElementById("pair-modal").style.display="flex"}
-function hidePairModal(){document.getElementById("pair-modal").style.display="none"}
-function pickRandom(){var p=randomPair();startGame(p[0],p[1])}
-
-function buildGrid(){
-  var grid=document.getElementById("pgrid");
-  PAIRS.forEach(function(p){
-    var btn=document.createElement("button");
-    btn.className="pbtn";
-    btn.textContent=(EM[p[0]]||"")+" "+p[0]+" \u2014 "+p[1]+" "+(EM[p[1]]||"");
-    btn.onclick=function(){startGame(p[0],p[1])};
-    grid.appendChild(btn);
-  });
+async function pickRandom(){
+  if(!getKey()){ var p=randomPair(); startGame(p[0],p[1]); return; }
+  if(nextPair){
+    var p=nextPair; nextPair=null;
+    startGame(p[0],p[1]);
+    preloadNextPair(); // prepare next in background
+    return;
+  }
+  toast("Подбираем пару слов...","load");
+  var candidates=[];
+  for(var i=0;i<5;i++) candidates.push(randomPair());
+  var results=await Promise.all(candidates.map(function(p){
+    var key=p[0]+"|"+p[1];
+    if(pairCache[key]!==undefined) return Promise.resolve({pair:p,score:pairCache[key]});
+    return quickScore(p[0],p[1]).then(function(score){
+      pairCache[key]=score; return {pair:p,score:score};
+    });
+  }));
+  results.sort(function(a,b){return a.score-b.score;});
+  var best=results[0].pair;
+  startGame(best[0],best[1]);
+  preloadNextPair(); // prepare next in background
 }
+
 
 function startGame(start,end){
   startWord=start;endWord=end;
-  // clear old
-  nodes.forEach(function(n){removeNodeEl(n)});
-  edges.forEach(function(e){removeEdgeEl(e)});
-  nodes=[];edges=[];nid=0;totalScore=0;selectedEdge=null;busy=false;
+  var svgEl2=document.getElementById("svg");
+  svgEl2.style.opacity="0";
+  setTimeout(function(){
+    // clear old
+    nodes.forEach(function(n){removeNodeEl(n)});
+    edges.forEach(function(e){removeEdgeEl(e)});
+    nodes=[];edges=[];nid=0;totalScore=0;selectedEdge=null;busy=false;
   var ga=document.getElementById("ga"),W=ga.clientWidth,H=ga.clientHeight;
   var n1={id:"start",word:start,type:"start",x:Math.round(W*0.22),y:Math.round(H/2),em:em(start)};
   var n2={id:"end",  word:end,  type:"end",  x:Math.round(W*0.78),y:Math.round(H/2),em:em(end)};
@@ -716,8 +874,12 @@ function startGame(start,end){
   document.getElementById("lbl-start").textContent=start;
   document.getElementById("lbl-end").textContent=end;
   document.getElementById("lbl-score").textContent="0";
-  hidePairModal();
-  toast("Build a bridge: "+start+" \u2014 "+end,"ok",3000);
+      document.getElementById("reasoning-bar").style.display="none";
+    document.getElementById("hints-bar").style.display="none";
+    checkFinishBtn();
+    setTimeout(function(){ svgEl2.style.opacity="1"; }, 50);
+    toast("Build a bridge: "+start+" \u2014 "+end,"ok",3000);
+  }, 300);
 }
 
 document.addEventListener("keydown",function(ev){
@@ -730,11 +892,9 @@ document.addEventListener("keydown",function(ev){
 });
 
 window.pickRandom=pickRandom;
-window.showPairModal=showPairModal;
 window.hideResult=hideResult;
 window.finishGame=finishGame;
 
-buildGrid();
 initSVG();
 pickRandom();
 window.addEventListener("resize",function(){
